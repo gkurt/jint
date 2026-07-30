@@ -898,6 +898,23 @@ public sealed partial class Engine : IDisposable
     }
 
     /// <summary>
+    /// The cycle a piece of work registered now belongs to. Read at registration time and carried by the
+    /// work, so that a completion arriving from a background thread after the cycle ended is discarded
+    /// rather than applied — see <see cref="EventLoop.Generation"/>.
+    /// </summary>
+    internal int EventLoopGeneration => _eventLoop.Generation;
+
+    /// <summary>
+    /// Queues the engine-thread half of an asynchronous module load. Separate from
+    /// <see cref="AddToEventLoop(Action, int)"/> only in name, to keep the module loader's one cross-thread
+    /// entry point findable.
+    /// </summary>
+    internal void EnqueueModuleLoadCompletion(Action continuation, int generation)
+    {
+        _eventLoop.Enqueue(new EventLoopJob(continuation, generation));
+    }
+
+    /// <summary>
     /// Called by the host when a promise rejection is tracked/untracked.
     /// Raises the <see cref="AdvancedOperations.PromiseRejectionTracker"/> event.
     /// </summary>
@@ -934,6 +951,22 @@ public sealed partial class Engine : IDisposable
     /// timeout while awaiting a never-settling Task.
     /// </remarks>
     internal void DrainEventLoopUntilSettled(JsPromise promise, TimeSpan timeout)
+        => DrainEventLoopUntil(static state => ((JsPromise) state).State != PromiseState.Pending, promise, promise.CompletedEvent, timeout);
+
+    /// <summary>
+    /// The general form of <see cref="DrainEventLoopUntilSettled"/>: drives the event loop until
+    /// <paramref name="isSettled"/> holds for <paramref name="state"/>. Used by the module load phase, where
+    /// what is being waited for is a host load finishing rather than a promise.
+    /// </summary>
+    /// <param name="isSettled">The condition to wait for, evaluated on this thread between drains.</param>
+    /// <param name="state">Passed to <paramref name="isSettled"/>, so the predicate need not be a closure.</param>
+    /// <param name="completedEvent">
+    /// Signalled when the awaited thing settles, so the idle waits end promptly instead of running out the
+    /// poll interval. May be null, in which case the loop polls.
+    /// </param>
+    /// <param name="timeout">Non-positive means wait indefinitely.</param>
+    /// <returns>Whether the condition held when the drain ended, i.e. false on timeout.</returns>
+    internal bool DrainEventLoopUntil(Func<object, bool> isSettled, object state, System.Threading.ManualResetEventSlim? completedEvent, TimeSpan timeout)
     {
         // Claim this thread as the one draining the loop so background threads (Task completions)
         // don't race to execute JavaScript continuations on the engine. Save/restore to support
@@ -953,13 +986,12 @@ public sealed partial class Engine : IDisposable
             var hasTimeout = timeout > TimeSpan.Zero;
             var deadline = hasTimeout ? DateTime.UtcNow + timeout : DateTime.MaxValue;
             var pollInterval = TimeSpan.FromMilliseconds(10);
-            var completedEvent = promise.CompletedEvent;
 
-            while (promise.State == PromiseState.Pending)
+            while (!isSettled(state))
             {
                 RunAvailableContinuations();
 
-                if (promise.State != PromiseState.Pending)
+                if (isSettled(state))
                 {
                     break;
                 }
@@ -981,7 +1013,19 @@ public sealed partial class Engine : IDisposable
 
                 try
                 {
-                    completedEvent.Wait(waitInterval, cancellationToken);
+                    if (completedEvent is not null)
+                    {
+                        completedEvent.Wait(waitInterval, cancellationToken);
+                    }
+                    else if (cancellationToken.CanBeCanceled)
+                    {
+                        cancellationToken.WaitHandle.WaitOne(waitInterval);
+                        cancellationToken.ThrowIfCancellationRequested();
+                    }
+                    else
+                    {
+                        System.Threading.Thread.Sleep(waitInterval);
+                    }
                 }
                 catch (OperationCanceledException)
                 {
@@ -991,6 +1035,8 @@ public sealed partial class Engine : IDisposable
                     Throw.ExecutionCanceledException();
                 }
             }
+
+            return isSettled(state);
         }
         finally
         {
